@@ -122,15 +122,13 @@ Status PrometheusWriter::WriteSingleEntry(
     const MetricEntity::AttributeMap& attr, const std::string& name, int64_t value,
     AggregationFunction aggregation_function, const char* type,
     const char* description) {
-  auto tablet_id_it = attr.find("table_id");
-  if (tablet_id_it == attr.end()) {
+  auto it = attr.find("table_id");
+  if (it == attr.end()) {
     if (export_help_and_type_) {
       FlushHelpAndType(name, type, description);
     }
     return FlushSingleEntry(attr, name, value);
   }
-  auto metric_type_it = attr.find("metric_type");
-  DCHECK(metric_type_it != attr.end());
   switch (aggregation_level_) {
   case AggregationMetricLevel::kServer:
   {
@@ -139,8 +137,7 @@ Status PrometheusWriter::WriteSingleEntry(
     new_attr.erase("table_name");
     new_attr.erase("table_type");
     new_attr.erase("namespace_name");
-    AddAggregatedEntry(metric_type_it->second, new_attr, name, value, aggregation_function,
-        type, description);
+    AddAggregatedEntry("", new_attr, name, value, aggregation_function, type, description);
     break;
   }
   case AggregationMetricLevel::kStream:
@@ -152,14 +149,7 @@ Status PrometheusWriter::WriteSingleEntry(
     break;
   }
   case AggregationMetricLevel::kTable:
-    if (metric_type_it->second == "table") {
-      if (export_help_and_type_) {
-        FlushHelpAndType(name, type, description);
-      }
-      return FlushSingleEntry(attr, name, value);
-    }
-    AddAggregatedEntry(tablet_id_it->second, attr, name, value, aggregation_function,
-        type, description);
+    AddAggregatedEntry(it->second, attr, name, value, aggregation_function, type, description);
     break;
   }
   return Status::OK();

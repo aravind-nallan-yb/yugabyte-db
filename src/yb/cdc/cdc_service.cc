@@ -24,13 +24,14 @@
 #include <boost/multi_index_container.hpp>
 
 #include "yb/cdc/cdc_producer.h"
-#include "yb/cdc/cdc_rpc.h"
+#include "yb/cdc/xcluster_rpc.h"
 #include "yb/cdc/cdc_service.proxy.h"
 #include "yb/cdc/cdc_service_context.h"
 #include "yb/cdc/cdc_state_table.h"
 #include "yb/cdc/cdc_types.h"
 #include "yb/cdc/xcluster_producer_bootstrap.h"
 #include "yb/cdc/xrepl_stream_metadata.h"
+#include "yb/cdc/xrepl_stream_stats.h"
 
 #include "yb/client/client.h"
 #include "yb/client/meta_cache.h"
@@ -99,10 +100,7 @@ DEFINE_UNKNOWN_int32(cdc_write_rpc_timeout_ms, 30 * 1000,
     "Timeout used for CDC write rpc calls.  Writes normally occur intra-cluster.");
 TAG_FLAG(cdc_write_rpc_timeout_ms, advanced);
 
-DEFINE_UNKNOWN_int32(cdc_ybclient_reactor_threads, 50,
-    "The number of reactor threads to be used for processing ybclient "
-    "requests for CDC.");
-TAG_FLAG(cdc_ybclient_reactor_threads, advanced);
+DEPRECATE_FLAG(int32, cdc_ybclient_reactor_threads, "09_2023");
 
 DEFINE_UNKNOWN_int32(cdc_state_checkpoint_update_interval_ms, kUpdateIntervalMs,
     "Rate at which CDC state's checkpoint is updated.");
@@ -169,6 +167,9 @@ DEFINE_test_flag(bool, force_get_checkpoint_from_cdc_state, false,
 DEFINE_RUNTIME_int32(xcluster_get_changes_max_send_rate_mbps, 100,
                      "Server-wide max send rate in megabytes per second for GetChanges response "
                      "traffic. Throttles xcluster but not cdc traffic.");
+
+DEFINE_RUNTIME_bool(enable_xcluster_stat_collection, true,
+    "When enabled, stats are collected from xcluster streams for reporting purposes.");
 
 DECLARE_bool(enable_log_retention_by_op_idx);
 
@@ -1463,6 +1464,7 @@ bool CDCServiceImpl::IsReplicationPausedForStream(const std::string& stream_id) 
 
 void CDCServiceImpl::GetChanges(
     const GetChangesRequestPB* req, GetChangesResponsePB* resp, RpcContext context) {
+  const auto start_time = MonoTime::Now();
   RPC_CHECK_AND_RETURN_ERROR(
       get_changes_rpc_sem_.TryAcquire(), STATUS(LeaderNotReadyToServe, "Not ready to serve"),
       resp->mutable_error(), CDCErrorPB::LEADER_NOT_READY, context);
@@ -1727,6 +1729,15 @@ void CDCServiceImpl::GetChanges(
     impl_->UpdateCDCStateMetadata(
         producer_tablet, commit_timestamp, cached_schema_details,
         OpId::FromPB(resp->cdc_sdk_checkpoint()));
+  }
+
+  if (FLAGS_enable_xcluster_stat_collection) {
+    const auto latest_wal_index = tablet_peer->log()->GetLatestEntryOpId().index;
+    auto sent_index = resp->checkpoint().op_id().index();
+    auto num_records = resp->records_size();
+    auto bytes_sent = num_records > 0 ? resp->ByteSizeLong() : 0;
+    record.GetTabletMetadata(req->tablet_id())
+        ->UpdateStats(start_time, status, num_records, bytes_sent, sent_index, latest_wal_index);
   }
 
   auto tablet_metric_row =
@@ -2833,7 +2844,7 @@ void CDCServiceImpl::TabletLeaderGetChanges(
       STATUS(
           Aborted,
           Format(
-              "Could not create valid handle for GetChangesCDCRpc: tablet=$0, peer=$1",
+              "Could not create valid handle for GetChangesRpc: tablet=$0, peer=$1",
               req->tablet_id(),
               peer->permanent_uuid())),
       resp->mutable_error(), CDCErrorPB::INTERNAL_ERROR, *context.get());
@@ -2847,11 +2858,9 @@ void CDCServiceImpl::TabletLeaderGetChanges(
   new_req.set_serve_as_proxy(false);
   CoarseTimePoint deadline = GetDeadline(*context, client());
 
-  *rpc_handle = CreateGetChangesCDCRpc(
-      deadline,
-      nullptr, /* RemoteTablet: will get this from 'new_req' */
-      client(),
-      &new_req,
+  *rpc_handle = rpc::xcluster::CreateGetChangesRpc(
+      deadline, nullptr, /* RemoteTablet: will get this from 'new_req' */
+      client(), &new_req,
       [this, resp, context, rpc_handle](const Status& status, GetChangesResponsePB&& new_resp) {
         auto retained = rpcs_.Unregister(rpc_handle);
         *resp = std::move(new_resp);
@@ -3734,6 +3743,18 @@ Result<std::shared_ptr<StreamMetadata>> CDCServiceImpl::GetStream(
   return stream_metadata;
 }
 
+std::vector<xrepl::StreamTabletStats> CDCServiceImpl::GetAllStreamTabletStats() const {
+  std::vector<xrepl::StreamTabletStats> result;
+  SharedLock l(mutex_);
+  for (const auto& [stream_id, metadata] : stream_metadata_) {
+    auto tablet_status = metadata->GetAllStreamTabletStats(stream_id);
+    result.insert(
+        std::end(result), std::make_move_iterator(std::begin(tablet_status)),
+        std::make_move_iterator(std::end(tablet_status)));
+  }
+  return result;
+}
+
 void CDCServiceImpl::RemoveStreamFromCache(const xrepl::StreamId& stream_id) {
   std::lock_guard l(mutex_);
   stream_metadata_.erase(stream_id);
@@ -3826,57 +3847,6 @@ void CDCServiceImpl::IsBootstrapRequired(
     }
   }
   context.RespondSuccess();
-}
-
-Result<bool> CDCServiceImpl::IsBootstrapRequiredForTablet(
-    tablet::TabletPeerPtr tablet_peer, const OpId& min_op_id, const CoarseTimePoint& deadline) {
-  auto log = tablet_peer->log();
-  const auto latest_opid = log->GetLatestEntryOpId();
-
-  if (min_op_id.index < 0) {
-    // The first index is a NoOp which can be ignored.
-    if (latest_opid.index > 1) {
-      // Bootstrap is needed if there is any data in the log.
-      // This is because only locally generated data is replicated via xcluster. This prevents
-      // infinite replication in bidirectional mode. But if the data in the log was from a prior
-      // xcluster stream (xcluster DR cases) then it will not get replicated even if we can read
-      // the log here. Reading the entire log to determine if any entries are external is too
-      // expensive so just assume a bootstrap is needed.
-      LOG(INFO) << "Tablet " << tablet_peer->tablet_id() << " has " << latest_opid.index
-                << " ops. Bootstrap is required.";
-      return true;
-    }
-
-    // No data in the log, so no bootstrap is needed.
-    return false;
-  }
-
-  if (min_op_id.index == latest_opid.index) {
-    // Consumer has caught up to producer.
-    return false;
-  }
-
-  OpId next_index = min_op_id;
-  next_index.index++;
-
-  int64_t last_readable_opid_index;
-  auto consensus = VERIFY_RESULT_OR_SET_CODE(
-      tablet_peer->GetConsensus(), CDCError(CDCErrorPB::LEADER_NOT_READY));
-
-  auto log_result = consensus->ReadReplicatedMessagesForCDC(
-      next_index, &last_readable_opid_index, deadline, true /* fetch_single_entry */);
-
-  if (!log_result.ok()) {
-    if (log_result.status().IsNotFound()) {
-      LOG(INFO) << "Couldn't read index " << next_index << ". Bootstrap required for tablet "
-                << tablet_peer->tablet_id() << ": " << log_result.status();
-      return true;
-    }
-
-    return log_result.status().CloneAndAddErrorCode(CDCError(CDCErrorPB::INTERNAL_ERROR));
-  }
-
-  return false;
 }
 
 Status CDCServiceImpl::UpdateChildrenTabletsOnSplitOpForCDCSDK(const ProducerTabletInfo& info) {

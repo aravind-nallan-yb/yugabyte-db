@@ -62,7 +62,7 @@
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
 
 #include "yb/master/catalog_manager_if.h"
-#include "yb/master/cdc_consumer_registry_service.h"
+#include "yb/master/xcluster_consumer_registry_service.h"
 #include "yb/master/mini_master.h"
 #include "yb/master/master_client.pb.h"
 #include "yb/master/master.h"
@@ -148,7 +148,6 @@ using client::YBTable;
 using client::YBTableName;
 using master::GetNamespaceInfoResponsePB;
 
-using pgwrapper::GetInt32;
 using pgwrapper::GetValue;
 using pgwrapper::PGConn;
 using pgwrapper::PGResultPtr;
@@ -334,6 +333,17 @@ class XClusterYsqlTest : public XClusterYsqlTestBase {
     }
     return WriteWorkload(
         start, end, &producer_cluster_, producer_table->name(), /* delete_op */ false,
+        use_transaction);
+  }
+
+  Status DeleteRowsInProducer(
+      uint32_t start, uint32_t end, std::shared_ptr<client::YBTable> producer_table = {},
+      bool use_transaction = false) {
+    if (!producer_table) {
+      producer_table = producer_table_;
+    }
+    return WriteWorkload(
+        start, end, &producer_cluster_, producer_table->name(), /* delete_op */ true,
         use_transaction);
   }
 
@@ -544,7 +554,7 @@ class XClusterYsqlTest : public XClusterYsqlTestBase {
         }
         int result;
         for (int i = 0; i < num_results; ++i) {
-          result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+          result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
           if (i != result) {
             return false;
           }
@@ -643,7 +653,7 @@ class XClusterYsqlTest : public XClusterYsqlTestBase {
           }
           int result;
           for (int i = 0; i < num_results; ++i) {
-            result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+            result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
             if (i != result) {
               return false;
             }
@@ -779,7 +789,7 @@ class XClusterYSqlTestConsistentTransactionsTest : public XClusterYsqlTest {
         LOG(INFO) << "Read records: " << num_read_records;
         if (commit_all_transactions) {
           for (uint32_t i = 0; i < num_read_records; ++i) {
-            auto val = ASSERT_RESULT(GetInt32(consumer_results.get(), i, 0));
+            auto val = ASSERT_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
             ASSERT_EQ(val, i);
           }
         }
@@ -1688,7 +1698,7 @@ void XClusterYsqlTest::ValidateSimpleReplicationWithPackedRowsUpgrade(
     ASSERT_EQ(kNumRecords, PQntuples(producer_results.get()));
     int result;
     for (int i = 0; i < kNumRecords; ++i) {
-      result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+      result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
       ASSERT_EQ(i, result);
     }
   }
@@ -1715,7 +1725,7 @@ void XClusterYsqlTest::ValidateSimpleReplicationWithPackedRowsUpgrade(
       }
       int result;
       for (int i = 0; i < num_results; ++i) {
-        result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+        result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
         if (i != result) {
           return false;
         }
@@ -1864,7 +1874,7 @@ TEST_F(XClusterYsqlTest, ReplicationWithBasicDDL) {
     }
     int result;
     for (int i = 0; i < num_results; ++i) {
-      result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+      result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
       if (i != result) {
         LOG(INFO) << "Different value for key " << i << ": " << result;
         return false;
@@ -2264,7 +2274,7 @@ TEST_F(XClusterYsqlTest, SetupUniverseReplicationWithProducerBootstrapId) {
       }
       int result;
       for (int i = 0; i < 5; ++i) {
-        result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+        result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
         if ((1000 + i) != result) {
           return false;
         }
@@ -2427,7 +2437,7 @@ TEST_F(XClusterYsqlTest, TablegroupReplication) {
       }
       int result;
       for (int i = 0; i < num_results; ++i) {
-        result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+        result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
         if (i != result) {
           return false;
         }
@@ -2574,30 +2584,17 @@ TEST_F(XClusterYsqlTest, IsBootstrapRequiredNotFlushed) {
     ASSERT_EQ(100, PQntuples(producer_results.get()));
     int result;
     for (int i = 0; i < 100; ++i) {
-      result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+      result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
       ASSERT_EQ(i, result);
     }
   }
 
   // 3. IsBootstrapRequired on already replicating streams should return false.
-  rpc::RpcController rpc;
-  cdc::IsBootstrapRequiredRequestPB req;
-  cdc::IsBootstrapRequiredResponsePB resp;
-  req.set_stream_id(stream_id.ToString());
-  req.add_tablet_ids(tablet_ids[0]);
-
-  ASSERT_OK(producer_cdc_proxy->IsBootstrapRequired(req, &resp, &rpc));
-  ASSERT_FALSE(resp.has_error());
-  ASSERT_FALSE(resp.bootstrap_required());
-
-  auto should_bootstrap = ASSERT_RESULT(
-      producer_cluster_.client_->IsBootstrapRequired({producer_tables_[0]->id()}, stream_id));
-  ASSERT_FALSE(should_bootstrap);
+  ASSERT_FALSE(
+      ASSERT_RESULT(producer_client()->IsBootstrapRequired({producer_table_->id()}, {stream_id})));
 
   // 4. IsBootstrapRequired without a valid stream should return true.
-  should_bootstrap =
-      ASSERT_RESULT(producer_cluster_.client_->IsBootstrapRequired({producer_tables_[0]->id()}));
-  ASSERT_TRUE(should_bootstrap);
+  ASSERT_TRUE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({producer_table_->id()})));
 
   // 4. Setup replication with data should fail.
   ASSERT_NOK(
@@ -2712,7 +2709,7 @@ TEST_F(XClusterYsqlTest, DeleteTableChecks) {
     ASSERT_EQ(100, PQntuples(producer_results.get()));
     int result;
     for (int i = 0; i < 100; ++i) {
-      result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+      result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
       ASSERT_EQ(i, result);
     }
   }
@@ -2771,7 +2768,7 @@ TEST_F(XClusterYsqlTest, DeleteTableChecks) {
       }
       int result;
       for (int i = 0; i < num_results; ++i) {
-        result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+        result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
         if (i != result) {
           return false;
         }
@@ -2820,7 +2817,7 @@ TEST_F(XClusterYsqlTest, TruncateTableChecks) {
     ASSERT_EQ(100, PQntuples(producer_results.get()));
     int result;
     for (int i = 0; i < 100; ++i) {
-      result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+      result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
       ASSERT_EQ(i, result);
     }
   }
@@ -2844,7 +2841,7 @@ TEST_F(XClusterYsqlTest, TruncateTableChecks) {
       }
       int result;
       for (int i = 0; i < num_results; ++i) {
-        result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+        result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
         if (i != result) {
           return false;
         }
@@ -3236,7 +3233,7 @@ void XClusterYsqlTest::ValidateRecordsXClusterWithCDCSDK(
   int result;
 
   for (int i = 0; i < batch_insert_count; ++i) {
-    result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+    result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
     ASSERT_EQ(i, result);
   }
 
@@ -3255,7 +3252,7 @@ void XClusterYsqlTest::ValidateRecordsXClusterWithCDCSDK(
     }
     int result;
     for (int i = 0; i < num_results; ++i) {
-      result = VERIFY_RESULT(GetInt32(consumer_results.get(), i, 0));
+      result = VERIFY_RESULT(GetValue<int32_t>(consumer_results.get(), i, 0));
       if (i != result) {
         return false;
       }
@@ -3303,7 +3300,7 @@ void XClusterYsqlTest::ValidateRecordsXClusterWithCDCSDK(
   producer_results = ScanToStrings(producer_table_->name(), &producer_cluster_);
   ASSERT_EQ(batch_insert_count * 2, PQntuples(producer_results.get()));
   for (int i = 10; i < 20; ++i) {
-    result = ASSERT_RESULT(GetInt32(producer_results.get(), i, 0));
+    result = ASSERT_RESULT(GetValue<int32_t>(producer_results.get(), i, 0));
     ASSERT_EQ(i, result);
   }
   // 5. Make sure this data is also replicated now.
@@ -3591,12 +3588,17 @@ TEST_F_EX(XClusterYsqlTest, DmlOperationsBlockedOnStandbyCluster, XClusterYsqlTe
   ASSERT_OK(SetRoleToStandbyAndWaitForValidSafeTime());
 
   // Test that INSERT, UPDATE, and DELETE operations fail while the cluster is on STANDBY mode.
+  const std::string allow_writes = "SET LOCAL yb_non_ddl_txn_for_sys_tables_allowed TO true;";
   for (auto& conn : consumer_conns) {
     for (const auto& query : queries) {
       const auto status = conn.Execute(query);
       ASSERT_NOK(status);
       ASSERT_STR_CONTAINS(
           status.ToString(), "Data modification by DML is forbidden with STANDBY xCluster role");
+
+      // Writes should be allowed when yb_non_ddl_txn_for_sys_tables_allowed is set
+      // which happens during ysql_upgrades
+      ASSERT_OK(conn.Execute(Format("$0 $1", allow_writes, query)));
     }
     ASSERT_OK(conn.FetchFormat("SELECT * FROM $0", kTableName));
   }
@@ -3683,5 +3685,38 @@ TEST_F(XClusterYsqlTest, RandomFailuresAfterApply) {
   }
   ASSERT_OK(VerifyNumRecords(producer_table_, &producer_cluster_, batch_count * kBatchSize));
   ASSERT_OK(VerifyWrittenRecords());
+}
+
+TEST_F(XClusterYsqlTest, IsBootstrapRequiredColocatedDB) {
+  // Make sure IsBootstrapRequired returns false when tables are empty and true when even one table
+  // in a colocated DB has data.
+  constexpr int kNTablets = 1;
+  std::vector<uint32_t> tables_vector = {kNTablets, kNTablets};
+  // Create two colocated tables on each cluster.
+  ASSERT_OK(SetUpWithParams(
+      tables_vector, tables_vector, /* replication_factor */ 3, /* num_masters */ 1,
+      true /* colocated */));
+  auto colocated_parent_table_id = ASSERT_RESULT(GetColocatedDatabaseParentTableId());
+
+  // Empty DB should not require bootstrap.
+  ASSERT_FALSE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({colocated_parent_table_id})));
+
+  // Adding table to replication should not make it require bootstrap.
+  ASSERT_OK(SetupUniverseReplication(producer_tables_));
+  ASSERT_FALSE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({colocated_parent_table_id})));
+
+  // Inserting data into one table should make it require bootstrap.
+  ASSERT_OK(InsertRowsInProducer(0, 1, producer_tables_[0]));
+  ASSERT_TRUE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({colocated_parent_table_id})));
+
+  // Delete all rows in the first table and inserting data into another table should still make it
+  // require bootstrap.
+  ASSERT_OK(DeleteRowsInProducer(0, 1, producer_tables_[0]));
+  ASSERT_OK(InsertRowsInProducer(0, 1, producer_tables_[1]));
+  ASSERT_TRUE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({colocated_parent_table_id})));
+
+  // Delete all rows in the second table should make it not require bootstrap.
+  ASSERT_OK(DeleteRowsInProducer(0, 1, producer_tables_[1]));
+  ASSERT_FALSE(ASSERT_RESULT(producer_client()->IsBootstrapRequired({colocated_parent_table_id})));
 }
 }  // namespace yb

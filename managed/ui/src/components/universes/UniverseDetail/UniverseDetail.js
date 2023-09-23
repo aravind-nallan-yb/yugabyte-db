@@ -45,7 +45,6 @@ import {
   getFeatureState
 } from '../../../utils/LayoutUtils';
 import { SecurityMenu } from '../SecurityModal/SecurityMenu';
-import { DBSettingsMenu } from '../DBSettingsModal/DBSettingsMenu';
 import { UniverseLevelBackup } from '../../backupv2/Universe/UniverseLevelBackup';
 import { UniverseSupportBundle } from '../UniverseSupportBundle/UniverseSupportBundle';
 import { XClusterReplication } from '../../xcluster/XClusterReplication';
@@ -94,11 +93,6 @@ class UniverseDetail extends Component {
   isRRFlagsEnabled = () => {
     const { featureFlags } = this.props;
     return featureFlags.test.enableRRGflags || featureFlags.released.enableRRGflags;
-  };
-
-  isEditDBSettingsEnabled = () => {
-    const { featureFlags } = this.props;
-    return featureFlags.test.enableConfigureDBApi || featureFlags.released.enableConfigureDBApi;
   };
 
   componentDidMount() {
@@ -198,12 +192,6 @@ class UniverseDetail extends Component {
     browserHistory.replace(browserHistory.getCurrentLocation().pathname);
   };
 
-  transitToDefaultRoute = () => {
-    const currentLocation = this.props.location;
-    currentLocation.query = currentLocation.query.tab ? { tab: currentLocation.query.tab } : {};
-    this.props.router.push(currentLocation);
-  };
-
   handleSubmitManageKey = (res) => {
     if (res.payload.isAxiosError) {
       this.setState({
@@ -239,7 +227,6 @@ class UniverseDetail extends Component {
       universe,
       tasks,
       universe: { currentUniverse, supportedReleases },
-      location: { query, pathname },
       showSoftwareUpgradesModal,
       showVMImageUpgradeModal,
       showTLSConfigurationModal,
@@ -288,7 +275,6 @@ class UniverseDetail extends Component {
 
     const providerUUID = primaryCluster?.userIntent?.provider;
     const provider = providers.data.find((provider) => provider.uuid === providerUUID);
-
     let onPremSkipProvisioning = false;
     if (provider && provider.code === 'onprem') {
       const onPremKey = accessKeys.data.find(
@@ -305,18 +291,13 @@ class UniverseDetail extends Component {
       runtimeConfigs?.data?.configEntries?.find((c) => c.key === 'yb.universe.auth.is_enforced')
         ?.value === 'true';
 
-    const type =
-      pathname.indexOf('edit') < 0
-        ? 'Create'
-        : this.props.params.type
-        ? this.props.params.type === 'primary'
-          ? 'Edit'
-          : 'Async'
-        : 'Edit';
+    const isConfigureYSQLEnabled =
+      runtimeConfigs?.data?.configEntries?.find((c) => c.key === 'yb.configure_db_api.ysql')
+        ?.value === 'true';
 
-    if (pathname === '/universes/create') {
-      return <UniverseFormContainer type="Create" />;
-    }
+    const isConfigureYCQLEnabled =
+      runtimeConfigs?.data?.configEntries?.find((c) => c.key === 'yb.configure_db_api.ycql')
+        ?.value === 'true';
 
     if (
       getPromiseState(currentUniverse).isLoading() ||
@@ -327,24 +308,6 @@ class UniverseDetail extends Component {
       return <YBLoading />;
     } else if (isEmptyObject(currentUniverse.data)) {
       return <span />;
-    }
-
-    if (type === 'Async' || (isNonEmptyObject(query) && query.edit && query.async)) {
-      if (isReadOnlyUniverse) {
-        // not fully legit but mandatory fallback for manually edited query
-        this.transitToDefaultRoute();
-      } else {
-        return <UniverseFormContainer type="Async" />;
-      }
-    }
-
-    if (type === 'Edit' || (isNonEmptyObject(query) && query.edit)) {
-      if (isReadOnlyUniverse) {
-        // not fully legit but mandatory fallback for manually edited query
-        this.transitToDefaultRoute();
-      } else {
-        return <UniverseFormContainer type="Edit" />;
-      }
     }
 
     if (getPromiseState(currentUniverse).isError()) {
@@ -749,17 +712,24 @@ class UniverseDetail extends Component {
                           </span>
                         </YBMenuItem>
                       )}
-                      {!universePaused && this.isEditDBSettingsEnabled() && (
+                      {!universePaused && isConfigureYSQLEnabled && (
                         <YBMenuItem
                           disabled={isUniverseStatusPending}
-                          onClick={() => showSubmenu('dbSettings')}
+                          onClick={showEnableYSQLModal}
                         >
                           <YBLabelWithIcon icon="fa fa-database fa-fw">
-                            Edit YSQL/YCQL Settings
+                            Edit YSQL Configuration
                           </YBLabelWithIcon>
-                          <span className="pull-right">
-                            <i className="fa fa-chevron-right submenu-icon" />
-                          </span>
+                        </YBMenuItem>
+                      )}
+                      {!universePaused && isConfigureYCQLEnabled && (
+                        <YBMenuItem
+                          disabled={isUniverseStatusPending}
+                          onClick={showEnableYCQLModal}
+                        >
+                          <YBLabelWithIcon icon="fa fa-database fa-fw">
+                            Edit YCQL Configuration
+                          </YBLabelWithIcon>
                         </YBMenuItem>
                       )}
                       {!universePaused && (
@@ -919,15 +889,6 @@ class UniverseDetail extends Component {
                           manageKeyAvailability={manageKeyAvailability}
                         />
                       </>
-                    ),
-                    dbSettings: (backToMainMenu) => (
-                      <>
-                        <DBSettingsMenu
-                          backToMainMenu={backToMainMenu}
-                          showEnableYSQLModal={showEnableYSQLModal}
-                          showEnableYCQLModal={showEnableYCQLModal}
-                        />
-                      </>
                     )
                   }}
                 />
@@ -979,7 +940,7 @@ class UniverseDetail extends Component {
           universe={currentUniverse.data}
           type="primary"
         />
-        {isCACertRotationEnabled && (
+        {isCACertRotationEnabled && showModal && visibleModal === 'tlsConfigurationModal' && (
           <EncryptionInTransit
             open={showModal && visibleModal === 'tlsConfigurationModal'}
             onClose={() => {
@@ -1030,6 +991,7 @@ class UniverseDetail extends Component {
           }}
           enforceAuth={isAuthEnforced}
           universeData={currentUniverse.data}
+          isItKubernetesUniverse={isItKubernetesUniverse}
         />
 
         <Measure onMeasure={this.onResize.bind(this)}>

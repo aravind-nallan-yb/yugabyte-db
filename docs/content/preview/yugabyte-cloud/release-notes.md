@@ -20,6 +20,23 @@ On this page:
 
 ## Change log
 
+### September 12, 2023
+
+**New Features**
+
+- Support for multi-region clusters and read replicas in Azure. You can now create dedicated clusters with multi-region deployment in Azure, as well as read replicas.
+
+### September 6, 2023
+
+**New Features**
+
+- Support for enabling and disabling YugabyteDB [encryption at rest](../cloud-secure-clusters/managed-ear/) using a customer managed key and rotating keys on encrypted clusters. Clusters must be using YugabyteDB v2.16.7 or later.
+- Support for [exporting cluster metrics](../cloud-monitor/metrics-export/) to Datadog.
+
+**Database**
+
+- Innovation track updated to 2.18.2.1.
+
 ### August 15, 2023
 
 **Database**
@@ -405,8 +422,6 @@ This release includes the following features:
 - **Metrics** - The **View Full Screen** option in charts on the cluster **Overview** and **Performance Metrics** pages does not work in some versions of Safari 14.0 (Big Sur).
 - **Metrics** - Some clusters in European regions may show occasional spikes in the YSQL Operations/sec chart. This is due to cluster health checks and can be ignored.
 - **Widely-dispersed regions** - For multi-region clusters with widely-dispersed regions, Performance Advisor, Slow Queries, and some metrics may not return any results.
-- **Read replicas**
-  - For clusters in AWS, removed read replicas can't be added back to the same region if the cluster has other read replicas. To add a read replica back to the same region, first remove all the read replicas and then add them all back.
 
 ### Known issues in Cloud Shell
 
